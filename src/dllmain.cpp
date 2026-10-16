@@ -10,6 +10,7 @@
 //   HealthIF vtable (GetHealth, SetHealth, DoDamage, Kill) -> god mode
 //   FreeCamControlMapper vtable (GetAxis, ButtonDown) -> keyboard flight
 //   ParameterSet + CActorCreator::CreateFromParameters -> actor spawner
+//   Script_ActorSetPosition (inlined here)      -> save/load position, teleport
 // The developer cheats "God", "Unlock levels", "Wireframe" and "Say Stress" are
 // registered but nothing in the retail game reads them, so god mode is done here
 // with a damage hook and the others are not exposed.
@@ -61,6 +62,7 @@ using DoDamage_t           = uint64_t(__fastcall*)(void* health, float amount, v
 using Kill_t               = uint64_t(__fastcall*)(void* health, void* source);
 using GetHealth_t          = float(__fastcall*)(void* health);
 using SetHealth_t          = void (__fastcall*)(void* health, float value);
+using UpdateState_t        = void (__fastcall*)(void* worldState);
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -98,6 +100,12 @@ static GetHealth_t       g_GetHealthOrig[2];
 static uint8_t*  g_playerHealth;        // player's HealthIF, valid while the avatar below is unchanged
 static uint8_t*  g_playerHealthOwner;
 
+static UpdateState_t g_UpdateState;     // WorldStateDBlock::UpdateState
+static uint32_t  g_posVfuncA, g_posVfuncB; // actor vtable offsets called after moving
+struct SavedPos { bool valid; float p[3]; };
+static SavedPos  g_slots[3];
+static volatile bool g_carry;           // player follows the free camera
+static volatile bool g_capturing;       // a key is being rebound in the menu: hotkeys are suspended
 static volatile bool g_god;
 static volatile LONG g_spawnIndex;
 static volatile DWORD g_lastDaemonTick;  // GetTickCount() of the last in-level frame
@@ -118,6 +126,10 @@ struct Keys
     int spawn     = VK_INSERT;
     int spawnNext = VK_NEXT;
     int spawnPrev = VK_PRIOR;
+    int slot[3]   = { VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3 };   // load; with Ctrl: save
+    int toCamera  = VK_END;
+    int carry     = VK_DELETE;
+    int saveMod   = VK_CONTROL;                                // hold + slot key = save
     // free camera flight
     int fwd = 'W', back = 'S', left = 'A', right = 'D';
     int up = VK_SPACE, down = 'C';
@@ -134,6 +146,7 @@ static bool  g_keyboardFlight = true;
 static bool  g_voiceFeedback = true;
 static float g_stepFps = 30.0f;
 static float g_spawnDistance = 5.0f;
+static float g_carryDrop = 1.5f;
 static bool  g_godBlocksKill = false;
 static bool  g_menuOnStart = false;
 
@@ -478,12 +491,102 @@ static void SpawnActor(int index)
 }
 
 // ---------------------------------------------------------------------------
+// Positions
+// ---------------------------------------------------------------------------
+static uint8_t* CurrentCamera()
+{
+    if (!g_CurrentCamera || !g_cameraDirector || !*g_cameraDirector || !g_loopScenes) return nullptr;
+    void** scenes = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(g_loopScenes) + 8);
+    return g_CurrentCamera(*g_cameraDirector, scenes ? scenes[0] : nullptr);
+}
+
+static bool FreeCameraActive()
+{
+    uint8_t* cam = CurrentCamera();
+    return cam && strcmp(reinterpret_cast<const char*>(cam + 0x20), "FreeCam") == 0;
+}
+
+// Same steps as the game's ActorSetPosition script command.
+static bool SetActorPosition(uint8_t* actor, const float* p)
+{
+    if (!actor || !g_UpdateState) return false;
+    float* pos = reinterpret_cast<float*>(actor + 0x80);
+    pos[0] = p[0]; pos[1] = p[1]; pos[2] = p[2];
+    g_UpdateState(actor + 0x50);
+    uint8_t* vtbl = *reinterpret_cast<uint8_t**>(actor);
+    reinterpret_cast<void(__fastcall*)(void*, int)>(*reinterpret_cast<void**>(vtbl + g_posVfuncA))(actor, 0);
+    reinterpret_cast<void(__fastcall*)(void*)>(*reinterpret_cast<void**>(vtbl + g_posVfuncB))(actor);
+    return true;
+}
+
+static void SaveSlotToIni(int i)
+{
+    char key[16], val[96];
+    sprintf_s(key, "Slot%d", i + 1);
+    sprintf_s(val, "%.3f %.3f %.3f", g_slots[i].p[0], g_slots[i].p[1], g_slots[i].p[2]);
+    WritePrivateProfileStringA("Positions", key, val, g_iniPath);
+}
+
+static void SavePosition(int i)
+{
+    uint8_t* avatar = PlayerAvatar();
+    if (!avatar) return;
+    memcpy(g_slots[i].p, avatar + 0x80, sizeof(g_slots[i].p));
+    g_slots[i].valid = true;
+    SaveSlotToIni(i);
+    Log("position %d saved: %.2f %.2f %.2f", i + 1, g_slots[i].p[0], g_slots[i].p[1], g_slots[i].p[2]);
+    Voice("cheat_on");
+}
+
+static void LoadPosition(int i)
+{
+    if (!g_slots[i].valid) { Log("position %d is empty", i + 1); return; }
+    if (SetActorPosition(PlayerAvatar(), g_slots[i].p))
+        Log("position %d loaded", i + 1);
+}
+
+static void TeleportToCamera()
+{
+    uint8_t* cam = CurrentCamera();
+    if (!cam || !FreeCameraActive()) { Log("teleport: free camera is not active"); return; }
+    float p[3] = { *reinterpret_cast<float*>(cam + 0x190), *reinterpret_cast<float*>(cam + 0x194),
+                   *reinterpret_cast<float*>(cam + 0x198) };
+    if (SetActorPosition(PlayerAvatar(), p))
+    {
+        Log("teleported to camera: %.2f %.2f %.2f", p[0], p[1], p[2]);
+        g_carry = false;
+        FreeCamera(true);               // back to the player
+    }
+}
+
+// Fly with the character: while the free camera is active the player is kept
+// just below it, so it travels with the camera and drops where you leave it.
+static void UpdateCarry()
+{
+    if (!g_carry) return;
+    uint8_t* cam = CurrentCamera();
+    if (!cam || !FreeCameraActive()) return;
+    float p[3] = { *reinterpret_cast<float*>(cam + 0x190), *reinterpret_cast<float*>(cam + 0x194) - g_carryDrop,
+                   *reinterpret_cast<float*>(cam + 0x198) };
+    SetActorPosition(PlayerAvatar(), p);
+}
+
+static void ToggleCarry()
+{
+    g_carry = !g_carry;
+    if (g_carry && !FreeCameraActive()) FreeCamera(true);
+    Log("fly with camera -> %s", g_carry ? "ON" : "OFF");
+}
+
+// ---------------------------------------------------------------------------
 // Command queue: the menu window (own thread) posts, the game thread executes
 // ---------------------------------------------------------------------------
 enum Command
 {
     CMD_FREECAM = 1, CMD_DETACH, CMD_GOD, CMD_STEALTH, CMD_AMMO,
-    CMD_PAUSE, CMD_STEP, CMD_SPAWN,
+    CMD_PAUSE, CMD_STEP, CMD_SPAWN, CMD_TO_CAMERA, CMD_CARRY,
+    CMD_SAVE = 200,                     // CMD_SAVE + slot
+    CMD_LOAD = 210,                     // CMD_LOAD + slot
     CMD_SPEED = 100,                    // CMD_SPEED + TimeSpeed
 };
 
@@ -510,8 +613,12 @@ static void Execute(int cmd)
     case CMD_PAUSE:   TogglePause(); break;
     case CMD_STEP:    FrameStep(); break;
     case CMD_SPAWN:   SpawnActor(g_spawnIndex); break;
+    case CMD_TO_CAMERA: TeleportToCamera(); break;
+    case CMD_CARRY:   ToggleCarry(); break;
     default:
-        if (cmd >= CMD_SPEED) SetTimeSpeed(cmd - CMD_SPEED);
+        if (cmd >= CMD_LOAD && cmd < CMD_LOAD + 3) LoadPosition(cmd - CMD_LOAD);
+        else if (cmd >= CMD_SAVE && cmd < CMD_SAVE + 3) SavePosition(cmd - CMD_SAVE);
+        else if (cmd >= CMD_SPEED && cmd < CMD_SAVE) SetTimeSpeed(cmd - CMD_SPEED);
     }
 }
 
@@ -532,7 +639,7 @@ static void __fastcall Daemon_Hook()
     }
 
     static KeyEdges keys;
-    if (GameHasFocus())
+    if (GameHasFocus() && !g_capturing)
     {
         if (keys.Pressed(g_keys.freeCam))   Post(CMD_FREECAM);
         if (keys.Pressed(g_keys.detach))    Post(CMD_DETACH);
@@ -543,6 +650,10 @@ static void __fastcall Daemon_Hook()
         if (keys.Pressed(g_keys.timeCycle)) CycleSpeed();
         if (keys.Pressed(g_keys.frameStep)) Post(CMD_STEP);
         if (keys.Pressed(g_keys.spawn))     Post(CMD_SPAWN);
+        if (keys.Pressed(g_keys.toCamera))  Post(CMD_TO_CAMERA);
+        if (keys.Pressed(g_keys.carry))     Post(CMD_CARRY);
+        for (int i = 0; i < 3; ++i)
+            if (keys.Pressed(g_keys.slot[i])) Post((Down(g_keys.saveMod) ? CMD_SAVE : CMD_LOAD) + i);
     }
 
     int cmds[64], n;
@@ -552,6 +663,7 @@ static void __fastcall Daemon_Hook()
     g_queueLen = 0;
     ReleaseSRWLockExclusive(&g_queueLock);
     for (int i = 0; i < n; ++i) Execute(cmds[i]);
+    UpdateCarry();
 
     g_DaemonOrig();
 }
@@ -565,7 +677,7 @@ static float KeyAxis(int neg, int pos)
 static float __fastcall GetAxis_Hook(void* self, int axis)
 {
     float v = g_GetAxisOrig(self, axis);
-    if (!g_keyboardFlight || !GameHasFocus()) return v;
+    if (!g_keyboardFlight || g_capturing || !GameHasFocus()) return v;
 
     float k = 0.0f;
     switch (axis)
@@ -589,7 +701,7 @@ static float __fastcall GetAxis_Hook(void* self, int axis)
 static bool __fastcall ButtonDown_Hook(void* self, int button, bool raw)
 {
     if (g_ButtonDownOrig(self, button, raw)) return true;
-    if (!g_keyboardFlight || !GameHasFocus()) return false;
+    if (!g_keyboardFlight || g_capturing || !GameHasFocus()) return false;
     if (button == 0) return Down(g_keys.up);
     if (button == 1) return Down(g_keys.down);
     return false;
@@ -640,6 +752,73 @@ static uint64_t __fastcall Kill_Hook(void* health, void* source)
 }
 
 // ---------------------------------------------------------------------------
+// Key bindings (shared by the menu and the bindings window)
+// ---------------------------------------------------------------------------
+struct Binding { const char* ini; const char* label; int* key; bool modifier; };
+
+static Binding g_bindings[] =
+{
+    { "Menu",             "Debug menu",                    &g_keys.menu },
+    { "FreeCamera",       "Free camera",                   &g_keys.freeCam },
+    { "FreeCameraDetach", "Freeze camera / return",        &g_keys.detach },
+    { "God",              "God mode",                      &g_keys.god },
+    { "Stealth",          "Stealth",                       &g_keys.stealth },
+    { "Ammo",             "Infinite ammo",                 &g_keys.ammo },
+    { "Pause",            "Pause / resume",                &g_keys.pause },
+    { "TimeCycle",        "Game speed",                    &g_keys.timeCycle },
+    { "FrameStep",        "Step frame",                    &g_keys.frameStep },
+    { "PositionSlot1",    "Position slot 1",               &g_keys.slot[0] },
+    { "PositionSlot2",    "Position slot 2",               &g_keys.slot[1] },
+    { "PositionSlot3",    "Position slot 3",               &g_keys.slot[2] },
+    { "SaveModifier",     "Save modifier (hold + slot)",   &g_keys.saveMod, true },
+    { "PlayerToCamera",   "Player to camera",              &g_keys.toCamera },
+    { "FlyWithCamera",    "Fly with camera",               &g_keys.carry },
+    { "Spawn",            "Spawn actor",                   &g_keys.spawn },
+    { "SpawnNext",        "Next actor",                    &g_keys.spawnNext },
+    { "SpawnPrev",        "Previous actor",                &g_keys.spawnPrev },
+    { "CamForward",       "Free camera: forward",          &g_keys.fwd },
+    { "CamBack",          "Free camera: back",             &g_keys.back },
+    { "CamLeft",          "Free camera: left",             &g_keys.left },
+    { "CamRight",         "Free camera: right",            &g_keys.right },
+    { "CamUp",            "Free camera: up",               &g_keys.up },
+    { "CamDown",          "Free camera: down",             &g_keys.down },
+    { "LookUp",           "Free camera: look up",          &g_keys.lookUp },
+    { "LookDown",         "Free camera: look down",        &g_keys.lookDown },
+    { "LookLeft",         "Free camera: look left",        &g_keys.lookLeft },
+    { "LookRight",        "Free camera: look right",       &g_keys.lookRight },
+    { "CamFast",          "Free camera: faster",           &g_keys.fast, true },
+    { "CamSlow",          "Free camera: slower",           &g_keys.slow, true },
+};
+static const int kBindingCount = (int)(sizeof(g_bindings) / sizeof(g_bindings[0]));
+
+static const char* KeyName(int vk)
+{
+    static char buf[8][48];
+    static int next;
+    char* out = buf[next++ & 7];
+    if (vk <= 0) { strcpy_s(out, 48, "-"); return out; }
+    if (vk >= VK_F1 && vk <= VK_F24) { sprintf_s(out, 48, "F%d", vk - VK_F1 + 1); return out; }
+    UINT sc = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+    switch (vk)
+    {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_RCONTROL: case VK_RMENU:
+    case VK_DIVIDE: case VK_NUMLOCK:
+        sc |= 0x100;                    // extended key
+    }
+    if (!sc || !GetKeyNameTextA(static_cast<LONG>(sc << 16), out, 48)) sprintf_s(out, 48, "0x%02X", vk);
+    return out;
+}
+
+static void WriteBinding(const Binding& b)
+{
+    char val[16];
+    if (*b.key >= VK_F1 && *b.key <= VK_F24) sprintf_s(val, "F%d", *b.key - VK_F1 + 1);
+    else sprintf_s(val, "0x%02X", *b.key);
+    WritePrivateProfileStringA("Keys", b.ini, val, g_iniPath);
+}
+
+// ---------------------------------------------------------------------------
 // Debug menu window (runs on its own thread, never activates/steals focus)
 // ---------------------------------------------------------------------------
 enum
@@ -647,47 +826,100 @@ enum
     ID_FREECAM = 1001, ID_DETACH, ID_GOD, ID_STEALTH, ID_AMMO,
     ID_PAUSE, ID_STEP, ID_SLOW8, ID_SLOW4, ID_SLOW2, ID_NORMAL, ID_FAST2,
     ID_LIST, ID_SPAWN, ID_STATUS,
+    ID_SAVE1, ID_SAVE2, ID_SAVE3, ID_LOAD1, ID_LOAD2, ID_LOAD3, ID_TOCAM, ID_CARRY,
+    ID_POSHINT, ID_KEYS,
+    ID_BIND_LIST = 1101, ID_BIND_CHANGE, ID_BIND_CLOSE, ID_BIND_STATUS,
 };
 
-static HWND g_menu, g_list, g_status, g_chkGod, g_chkStealth, g_chkAmmo;
+static HWND g_menu, g_list, g_status, g_chkGod, g_chkStealth, g_chkAmmo, g_chkCarry;
+static HWND g_keysWnd, g_bindList, g_bindStatus;
+
+// Layout is written in 96-DPI units and scaled to the system DPI.
+static int   g_dpi = 96;
+static HFONT g_font;
+
+static int S(int v) { return MulDiv(v, g_dpi, 96); }
 
 static HWND Control(HWND parent, const char* cls, const char* text, DWORD style, int x, int y, int w, int h, int id)
 {
-    HWND c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
+    HWND c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), parent,
                              reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_self, nullptr);
-    SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_font ? g_font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     return c;
 }
 
+static void SetText(HWND w, int id, const char* fmt, ...)
+{
+    char text[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf_s(text, fmt, ap);
+    va_end(ap);
+    SetDlgItemTextA(w, id, text);
+}
+
+// Button captions show the current key bindings.
+static void UpdateMenuLabels()
+{
+    HWND w = g_menu;
+    const Keys& k = g_keys;
+    SetText(w, ID_FREECAM, "Free camera (%s)", KeyName(k.freeCam));
+    SetText(w, ID_DETACH,  "Freeze / return (%s)", KeyName(k.detach));
+    SetText(w, ID_GOD,     "God (%s)", KeyName(k.god));
+    SetText(w, ID_STEALTH, "Stealth (%s)", KeyName(k.stealth));
+    SetText(w, ID_AMMO,    "Ammo (%s)", KeyName(k.ammo));
+    SetText(w, ID_PAUSE,   "Pause / resume (%s)", KeyName(k.pause));
+    SetText(w, ID_STEP,    "Step frame (%s)", KeyName(k.frameStep));
+    SetText(w, ID_POSHINT, "Load: %s / %s / %s     Save: %s + slot key", KeyName(k.slot[0]), KeyName(k.slot[1]),
+            KeyName(k.slot[2]), KeyName(k.saveMod));
+    SetText(w, ID_TOCAM,   "Player to camera (%s)", KeyName(k.toCamera));
+    SetText(w, ID_CARRY,   "Fly with camera (%s)", KeyName(k.carry));
+    SetText(w, ID_SPAWN,   "Spawn (%s / double-click)", KeyName(k.spawn));
+}
+
+// Client area: 360 x 676 (96-DPI units); every row spans 16..344.
 static void BuildMenu(HWND w)
 {
     const DWORD btn = BS_PUSHBUTTON, chk = BS_CHECKBOX, grp = BS_GROUPBOX;
-    Control(w, "BUTTON", "Camera", grp, 8, 4, 264, 50, 0);
-    Control(w, "BUTTON", "Free camera (F1)", btn, 16, 22, 120, 24, ID_FREECAM);
-    Control(w, "BUTTON", "Freeze / return (F2)", btn, 144, 22, 120, 24, ID_DETACH);
+    Control(w, "BUTTON", "Camera", grp, 8, 4, 344, 56, 0);
+    Control(w, "BUTTON", "", btn, 16, 24, 160, 26, ID_FREECAM);
+    Control(w, "BUTTON", "", btn, 184, 24, 160, 26, ID_DETACH);
 
-    Control(w, "BUTTON", "Cheats", grp, 8, 58, 264, 46, 0);
-    g_chkGod     = Control(w, "BUTTON", "God (F3)", chk, 16, 76, 76, 20, ID_GOD);
-    g_chkStealth = Control(w, "BUTTON", "Stealth (F4)", chk, 96, 76, 84, 20, ID_STEALTH);
-    g_chkAmmo    = Control(w, "BUTTON", "Ammo (F5)", chk, 186, 76, 80, 20, ID_AMMO);
+    Control(w, "BUTTON", "Cheats", grp, 8, 64, 344, 50, 0);
+    g_chkGod     = Control(w, "BUTTON", "", chk, 16, 84, 104, 22, ID_GOD);
+    g_chkStealth = Control(w, "BUTTON", "", chk, 124, 84, 108, 22, ID_STEALTH);
+    g_chkAmmo    = Control(w, "BUTTON", "", chk, 236, 84, 112, 22, ID_AMMO);
 
-    Control(w, "BUTTON", "Time", grp, 8, 108, 264, 78, 0);
-    Control(w, "BUTTON", "Pause / resume (F6)", btn, 16, 126, 120, 24, ID_PAUSE);
-    Control(w, "BUTTON", "Step frame (F8)", btn, 144, 126, 120, 24, ID_STEP);
-    Control(w, "BUTTON", "1/8", btn, 16, 154, 46, 24, ID_SLOW8);
-    Control(w, "BUTTON", "1/4", btn, 66, 154, 46, 24, ID_SLOW4);
-    Control(w, "BUTTON", "1/2", btn, 116, 154, 46, 24, ID_SLOW2);
-    Control(w, "BUTTON", "1x", btn, 166, 154, 46, 24, ID_NORMAL);
-    Control(w, "BUTTON", "2x", btn, 216, 154, 48, 24, ID_FAST2);
+    Control(w, "BUTTON", "Time", grp, 8, 118, 344, 86, 0);
+    Control(w, "BUTTON", "", btn, 16, 138, 160, 26, ID_PAUSE);
+    Control(w, "BUTTON", "", btn, 184, 138, 160, 26, ID_STEP);
+    Control(w, "BUTTON", "1/8x", btn, 16, 170, 62, 26, ID_SLOW8);
+    Control(w, "BUTTON", "1/4x", btn, 82, 170, 62, 26, ID_SLOW4);
+    Control(w, "BUTTON", "1/2x", btn, 148, 170, 62, 26, ID_SLOW2);
+    Control(w, "BUTTON", "1x", btn, 214, 170, 62, 26, ID_NORMAL);
+    Control(w, "BUTTON", "2x", btn, 280, 170, 64, 26, ID_FAST2);
 
-    Control(w, "BUTTON", "Spawn actor", grp, 8, 190, 264, 268, 0);
+    Control(w, "BUTTON", "Position", grp, 8, 208, 344, 140, 0);
+    Control(w, "BUTTON", "Save 1", btn, 16, 228, 105, 26, ID_SAVE1);
+    Control(w, "BUTTON", "Save 2", btn, 127, 228, 106, 26, ID_SAVE2);
+    Control(w, "BUTTON", "Save 3", btn, 239, 228, 105, 26, ID_SAVE3);
+    Control(w, "BUTTON", "Load 1", btn, 16, 258, 105, 26, ID_LOAD1);
+    Control(w, "BUTTON", "Load 2", btn, 127, 258, 106, 26, ID_LOAD2);
+    Control(w, "BUTTON", "Load 3", btn, 239, 258, 105, 26, ID_LOAD3);
+    Control(w, "BUTTON", "", btn, 16, 290, 160, 26, ID_TOCAM);
+    g_chkCarry = Control(w, "BUTTON", "", chk, 184, 292, 164, 22, ID_CARRY);
+    Control(w, "STATIC", "", SS_LEFT | SS_ENDELLIPSIS, 16, 322, 330, 18, ID_POSHINT);
+
+    Control(w, "BUTTON", "Spawn actor", grp, 8, 352, 344, 262, 0);
     g_list = Control(w, "LISTBOX", "", WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                     16, 208, 248, 210, ID_LIST);
+                     16, 372, 328, 200, ID_LIST);
     for (int i = 0; i < kSpawnCount; ++i) SendMessageA(g_list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kSpawnDefs[i].name));
     SendMessageA(g_list, LB_SETCURSEL, g_spawnIndex, 0);
-    Control(w, "BUTTON", "Spawn (Insert / double-click)", btn, 16, 424, 248, 26, ID_SPAWN);
+    Control(w, "BUTTON", "", btn, 16, 578, 328, 28, ID_SPAWN);
 
-    g_status = Control(w, "STATIC", "", SS_LEFT, 10, 464, 260, 16, ID_STATUS);
+    Control(w, "BUTTON", "Key bindings...", btn, 8, 620, 344, 28, ID_KEYS);
+    g_status = Control(w, "STATIC", "", SS_LEFT | SS_ENDELLIPSIS, 10, 654, 340, 18, ID_STATUS);
+    UpdateMenuLabels();
 }
 
 static void RefreshMenu()
@@ -696,6 +928,7 @@ static void RefreshMenu()
     SendMessageA(g_chkGod, BM_SETCHECK, g_god ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_chkStealth, BM_SETCHECK, CheatEnabled("Stealth") ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_chkAmmo, BM_SETCHECK, CheatEnabled("Ammo") ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(g_chkCarry, BM_SETCHECK, g_carry ? BST_CHECKED : BST_UNCHECKED, 0);
 
     const char* speed = "1x";
     switch (CurrentSpeed())
@@ -707,22 +940,150 @@ static void RefreshMenu()
     case SPEED_DOUBLE:  speed = "2x"; break;
     }
     char text[128];
-    sprintf_s(text, inLevel ? "In level  |  time: %s  |  Home hides" : "Not in a level - actions wait  |  Home hides", speed);
+    if (inLevel) sprintf_s(text, "In level  |  time: %s  |  %s hides", speed, KeyName(g_keys.menu));
+    else         sprintf_s(text, "Not in a level - actions wait  |  %s hides", KeyName(g_keys.menu));
     char old[128];
     GetWindowTextA(g_status, old, sizeof(old));
     if (strcmp(old, text) != 0) SetWindowTextA(g_status, text);
 }
 
-static void ToggleMenu()
+static void PlaceNearGame(HWND w, int dx, int dy)
 {
-    if (IsWindowVisible(g_menu)) { ShowWindow(g_menu, SW_HIDE); return; }
     HWND game = GetForegroundWindow();
     RECT r;
-    if (game && game != g_menu && GetWindowRect(game, &r))
-        SetWindowPos(g_menu, HWND_TOPMOST, r.left + 24, r.top + 48, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    if (game && game != g_menu && game != g_keysWnd && GetWindowRect(game, &r))
+        SetWindowPos(w, HWND_TOPMOST, r.left + dx, r.top + dy, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static void ToggleMenu()
+{
+    if (IsWindowVisible(g_menu)) { ShowWindow(g_menu, SW_HIDE); ShowWindow(g_keysWnd, SW_HIDE); return; }
+    PlaceNearGame(g_menu, 24, 48);
     ShowWindow(g_menu, SW_SHOWNOACTIVATE);
 }
 
+// --- key bindings window ----------------------------------------------------
+static int  g_captureIndex = -1;
+static int  g_captureStage;             // 1 wait for release, 2 wait for key, 3 wait for release again
+static bool g_captureHeld[256];
+
+static void FillBindingList()
+{
+    LRESULT sel = SendMessageA(g_bindList, LB_GETCURSEL, 0, 0);
+    SendMessageA(g_bindList, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < kBindingCount; ++i)
+    {
+        char line[128];
+        sprintf_s(line, "%s\t%s", g_bindings[i].label, KeyName(*g_bindings[i].key));
+        SendMessageA(g_bindList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line));
+    }
+    SendMessageA(g_bindList, LB_SETCURSEL, sel >= 0 ? sel : 0, 0);
+}
+
+static bool AnyKeyDown()
+{
+    for (int vk = 8; vk < 255; ++vk)
+        if (Down(vk)) return true;
+    return false;
+}
+
+static void StartCapture()
+{
+    LRESULT sel = SendMessageA(g_bindList, LB_GETCURSEL, 0, 0);
+    if (sel < 0) return;
+    g_captureIndex = (int)sel;
+    g_captureStage = 1;
+    g_capturing = true;
+    char text[160];
+    sprintf_s(text, "Press a key for \"%s\" (Esc cancels)", g_bindings[sel].label);
+    SetWindowTextA(g_bindStatus, text);
+}
+
+static void UpdateCapture()
+{
+    if (g_captureStage == 1 && !AnyKeyDown()) g_captureStage = 2;
+    else if (g_captureStage == 2)
+    {
+        for (int vk = 8; vk < 255; ++vk)
+        {
+            if (!Down(vk)) continue;
+            Binding& b = g_bindings[g_captureIndex];
+            if (vk == VK_ESCAPE)
+                SetWindowTextA(g_bindStatus, "Cancelled");
+            else
+            {
+                // generic Shift/Ctrl/Alt only make sense as modifiers; otherwise keep the left/right key
+                if ((vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) && !b.modifier) continue;
+                *b.key = vk;
+                WriteBinding(b);
+                char text[160];
+                sprintf_s(text, "%s = %s (saved to ini)", b.label, KeyName(vk));
+                SetWindowTextA(g_bindStatus, text);
+                FillBindingList();
+                UpdateMenuLabels();
+            }
+            g_captureStage = 3;
+            break;
+        }
+    }
+    else if (g_captureStage == 3 && !AnyKeyDown())
+    {
+        g_captureStage = 0;
+        g_captureIndex = -1;
+        g_capturing = false;
+    }
+}
+
+static LRESULT CALLBACK KeysProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_TIMER:
+        if (g_captureStage) UpdateCapture();
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == ID_BIND_CHANGE || (LOWORD(wp) == ID_BIND_LIST && HIWORD(wp) == LBN_DBLCLK)) StartCapture();
+        if (LOWORD(wp) == ID_BIND_CLOSE) ShowWindow(w, SW_HIDE);
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(w, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+static void ShowKeysWindow()
+{
+    if (IsWindowVisible(g_keysWnd)) { ShowWindow(g_keysWnd, SW_HIDE); return; }
+    FillBindingList();
+    SetWindowTextA(g_bindStatus, "Pick an action, then Change key (or double-click)");
+    RECT r;
+    GetWindowRect(g_menu, &r);
+    SetWindowPos(g_keysWnd, HWND_TOPMOST, r.right + 8, r.top, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    ShowWindow(g_keysWnd, SW_SHOWNOACTIVATE);
+}
+
+static HWND CreateToolWindow(const char* cls, const char* title, WNDPROC proc, int w, int h)
+{
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = proc;
+    wc.hInstance = g_self;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassA(&wc);
+
+    RECT r = { 0, 0, S(w), S(h) };
+    const DWORD style = WS_CAPTION | WS_SYSMENU | WS_POPUP;
+    const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    AdjustWindowRectEx(&r, style, FALSE, exStyle);
+    return CreateWindowExA(exStyle, cls, title, style, 40, 60, r.right - r.left, r.bottom - r.top,
+                           nullptr, nullptr, g_self, nullptr);
+}
+
+// --- main menu window ----------------------------------------------------------
 static LRESULT CALLBACK MenuProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 {
     static KeyEdges keys;
@@ -731,7 +1092,7 @@ static LRESULT CALLBACK MenuProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;           // clicking must not take focus from the game
     case WM_TIMER:
-        if (GameHasFocus())
+        if (GameHasFocus() && !g_capturing)
         {
             if (keys.Pressed(g_keys.menu)) ToggleMenu();
             int step = keys.Pressed(g_keys.spawnNext) ? 1 : keys.Pressed(g_keys.spawnPrev) ? -1 : 0;
@@ -759,6 +1120,11 @@ static LRESULT CALLBACK MenuProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         case ID_NORMAL:  Post(CMD_SPEED + SPEED_NORMAL); break;
         case ID_FAST2:   Post(CMD_SPEED + SPEED_DOUBLE); break;
         case ID_SPAWN:   Post(CMD_SPAWN); break;
+        case ID_SAVE1: case ID_SAVE2: case ID_SAVE3: Post(CMD_SAVE + LOWORD(wp) - ID_SAVE1); break;
+        case ID_LOAD1: case ID_LOAD2: case ID_LOAD3: Post(CMD_LOAD + LOWORD(wp) - ID_LOAD1); break;
+        case ID_TOCAM:   Post(CMD_TO_CAMERA); break;
+        case ID_CARRY:   Post(CMD_CARRY); break;
+        case ID_KEYS:    ShowKeysWindow(); break;
         case ID_LIST:
             if (HIWORD(wp) == LBN_SELCHANGE || HIWORD(wp) == LBN_DBLCLK)
             {
@@ -771,6 +1137,7 @@ static LRESULT CALLBACK MenuProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_CLOSE:
         ShowWindow(w, SW_HIDE);
+        ShowWindow(g_keysWnd, SW_HIDE);
         return 0;
     }
     return DefWindowProcA(w, msg, wp, lp);
@@ -778,23 +1145,31 @@ static LRESULT CALLBACK MenuProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 
 static DWORD WINAPI MenuThread(LPVOID)
 {
-    WNDCLASSA wc = {};
-    wc.lpfnWndProc = MenuProc;
-    wc.hInstance = g_self;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "TS3DebugMenu";
-    RegisterClassA(&wc);
+    // Per-monitor DPI awareness for our windows only (the game keeps its own setting).
+    using SetCtx_t = HANDLE(WINAPI*)(HANDLE);
+    if (auto setCtx = reinterpret_cast<SetCtx_t>(GetProcAddress(GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext")))
+        setCtx(reinterpret_cast<HANDLE>(-3));   // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
+    using GetDpi_t = UINT(WINAPI*)();
+    if (auto getDpi = reinterpret_cast<GetDpi_t>(GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForSystem")))
+        g_dpi = static_cast<int>(getDpi());
+    g_font = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
 
-    RECT r = { 0, 0, 280, 486 };
-    const DWORD style = WS_CAPTION | WS_SYSMENU | WS_POPUP;
-    const DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-    AdjustWindowRectEx(&r, style, FALSE, exStyle);
-    g_menu = CreateWindowExA(exStyle, wc.lpszClassName, "TS3Debug", style, 40, 60,
-                             r.right - r.left, r.bottom - r.top, nullptr, nullptr, g_self, nullptr);
-    if (!g_menu) { Log("menu window failed: %lu", GetLastError()); return 0; }
+    g_menu = CreateToolWindow("TS3DebugMenu", "TS3Debug", MenuProc, 360, 676);
+    g_keysWnd = CreateToolWindow("TS3DebugKeys", "TS3Debug - key bindings", KeysProc, 380, 452);
+    if (!g_menu || !g_keysWnd) { Log("menu window failed: %lu", GetLastError()); return 0; }
     BuildMenu(g_menu);
+
+    g_bindList = Control(g_keysWnd, "LISTBOX", "", WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_USETABSTOPS,
+                         8, 8, 364, 360, ID_BIND_LIST);
+    int tab = 150;                      // dialog units: key column
+    SendMessageA(g_bindList, LB_SETTABSTOPS, 1, reinterpret_cast<LPARAM>(&tab));
+    Control(g_keysWnd, "BUTTON", "Change key", BS_PUSHBUTTON, 8, 376, 180, 28, ID_BIND_CHANGE);
+    Control(g_keysWnd, "BUTTON", "Close", BS_PUSHBUTTON, 192, 376, 180, 28, ID_BIND_CLOSE);
+    g_bindStatus = Control(g_keysWnd, "STATIC", "", SS_LEFT, 8, 412, 364, 36, ID_BIND_STATUS);
+
     SetTimer(g_menu, 1, 50, nullptr);
+    SetTimer(g_keysWnd, 1, 30, nullptr);
     if (g_menuOnStart) ShowWindow(g_menu, SW_SHOWNOACTIVATE);
 
     MSG m;
@@ -847,6 +1222,12 @@ static void LoadConfig()
     k.spawn     = IniKey("Spawn", k.spawn);
     k.spawnNext = IniKey("SpawnNext", k.spawnNext);
     k.spawnPrev = IniKey("SpawnPrev", k.spawnPrev);
+    k.slot[0]   = IniKey("PositionSlot1", k.slot[0]);
+    k.slot[1]   = IniKey("PositionSlot2", k.slot[1]);
+    k.slot[2]   = IniKey("PositionSlot3", k.slot[2]);
+    k.toCamera  = IniKey("PlayerToCamera", k.toCamera);
+    k.carry     = IniKey("FlyWithCamera", k.carry);
+    k.saveMod   = IniKey("SaveModifier", k.saveMod);
     k.fwd       = IniKey("CamForward", k.fwd);
     k.back      = IniKey("CamBack", k.back);
     k.left      = IniKey("CamLeft", k.left);
@@ -871,6 +1252,14 @@ static void LoadConfig()
     g_stepFps        = IniFloat("General", "FrameStepFps", g_stepFps);
     g_spawnDistance  = IniFloat("General", "SpawnDistance", g_spawnDistance);
     g_godBlocksKill  = IniBool("General", "GodBlocksInstantKill", g_godBlocksKill);
+    g_carryDrop      = IniFloat("General", "FlyHeightBelowCamera", g_carryDrop);
+    for (int i = 0; i < 3; ++i)
+    {
+        char key[16], val[96];
+        sprintf_s(key, "Slot%d", i + 1);
+        GetPrivateProfileStringA("Positions", key, "", val, sizeof(val), g_iniPath);
+        g_slots[i].valid = sscanf_s(val, "%f %f %f", &g_slots[i].p[0], &g_slots[i].p[1], &g_slots[i].p[2]) == 3;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1336,19 @@ static bool Init()
     // a spawner calling CreateFromParameters(set, pos, 0.0f, false, false)
     if (uint8_t* p = FindPattern("C6 44 24 20 00 45 33 C9 0F 57 D2 48 8D 54 24 38 48 8D 4C 24 78 E8"))
         g_CreateActor = reinterpret_cast<CreateActor_t>(Rip(p + 21, 1, 5));
+
+    // Script_ActorSetPosition: pop vector; pop actor; write actor+0x80; UpdateState(actor+0x50); vfunc A(0); vfunc B()
+    if (uint8_t* p = FindPattern("40 53 48 83 EC 30 48 8D 54 24 20 48 8B D9 E8 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? "
+                                 "48 8B D8 48 85 C0 74 ?? F3 0F 10 54 24 20 48 8D 48 50"))
+    {
+        if (p[0x48] == 0xE8 && p[0x52] == 0x48 && p[0x53] == 0x8B && p[0x54] == 0x81 && p[0x64] == 0xFF && p[0x65] == 0x90)
+        {
+            g_UpdateState = reinterpret_cast<UpdateState_t>(Rip(p + 0x48, 1, 5));
+            g_posVfuncA = *reinterpret_cast<uint32_t*>(p + 0x55);
+            g_posVfuncB = *reinterpret_cast<uint32_t*>(p + 0x66);
+        }
+    }
+    Log("UpdateState=%p posVfunc=%#x/%#x", g_UpdateState, g_posVfuncA, g_posVfuncB);
 
     // HealthIF subobject vtables (offset 0x18) of both health tracker classes
     void** healthVtbl[2] = { FindVtable(".?AVTS3HealthTracker@@", 0x18), FindVtable(".?AVHealthTracker@@", 0x18) };

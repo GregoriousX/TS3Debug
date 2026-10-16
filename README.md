@@ -2,8 +2,8 @@
 
 An ASI plugin for **Toy Story 3: Complete Edition** (PC, Steam) that turns on debug
 features left in the game: a **free camera**, **god mode**, hidden cheats (stealth, infinite ammo),
-**pause / slow motion / frame-by-frame advance**, an **actor spawner** with 43 characters and
-creatures, and a **debug menu** to drive it all with the mouse.
+**pause / slow motion / frame-by-frame advance**, **save / load position** and **teleporting**,
+an **actor spawner** with 43 characters and creatures, and a **debug menu** to drive it all with the mouse.
 
 ## Features
 
@@ -20,6 +20,10 @@ creatures, and a **debug menu** to drive it all with the mouse.
 | **F8** | Frame advance: pauses time if needed, then each press steps one frame (F6 resumes) |
 | **Insert** | Spawn the selected actor in front of the player |
 | **Page Down / Page Up** | Select the next / previous actor |
+| **Ctrl + Numpad 1/2/3** | Save the character's position to slot 1/2/3 (the modifier is configurable) |
+| **Numpad 1/2/3** | Teleport the character to saved position 1/2/3 |
+| **End** | Teleport the character to the free camera and leave free camera mode |
+| **Delete** | Fly with your character: it follows the free camera until you turn this off |
 
 **Debug menu (Home):** a small always-on-top window with buttons for every feature, the
 time controls and a list of all spawnable actors (double-click to spawn). It never takes focus away
@@ -34,6 +38,11 @@ see it on top of the game.
 | Look | Arrow keys | Right stick |
 | Up / down | Space / C | RB / RT |
 | Faster / slower | Left Shift / Left Ctrl | — |
+
+**For speedrunners:** save a position before a tricky section and reload it as often as you like.
+Saved positions are stored in `TS3Debug.ini`, so they survive restarts. They are just coordinates,
+so load a slot only in the level where you saved it. To get somewhere new, turn on the free camera (F1),
+fly there and press End. Or press Delete to fly with your character and switch it off where you want to land.
 
 Tip: **Pause (F6) + free camera (F1)** works as a photo mode, and **F8** lets you step through
 the action one frame at a time.
@@ -66,7 +75,11 @@ To uninstall, delete `dinput8.dll`, `TS3Debug.asi`, `TS3Debug.ini` and `TS3Debug
 
 ## Configuration
 
-Every key and option can be changed in `TS3Debug.ini`. You can write a key as
+**Rebinding keys:** open the debug menu (Home) and click **Key bindings...**. Pick an action, click
+**Change key** (or double-click it) and press the new key. Esc cancels. The change applies at once
+and is saved to `TS3Debug.ini`. Menu buttons always show the current keys.
+
+Every key and option can also be changed in `TS3Debug.ini`. You can write a key as
 `F1`–`F12`, as a single letter (`W`), or as a
 [virtual-key code](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes)
 (`0x20` = Space).
@@ -75,6 +88,7 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
 |--------|---------|-------------|
 | `VoiceFeedback` | `1` | Play the game's cheat on/off sound |
 | `ShowMenuOnStart` | `0` | Open the debug menu when the game starts |
+| `FlyHeightBelowCamera` | `1.5` | How far below the free camera your character is carried while flying |
 | `GodBlocksInstantKill` | `0` | God mode also blocks instant kills, such as falling off the level (you may fall forever) |
 | `FrameStepFps` | `30` | How much time one frame advance step covers |
 | `SpawnDistance` | `5.0` | How far in front of the player actors spawn |
@@ -105,6 +119,7 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
 - The free camera is the engine's own. The plugin only switches it on and off.
 - Pause, game speed and frame advance drive the game's master timer directly, using its built-in
   speed settings and single-step mode.
+- Position save/load and teleporting move the character the same way the game's own level scripts do.
 - God mode lets hits play out normally, so knock-backs and recovery work as usual. It caps
   damage so a hit can never be lethal, then refills the player's health.
 - The actor spawner builds each actor from its parameter list and passes it to the game's own actor creator, the same way the game spawns actors in levels.
