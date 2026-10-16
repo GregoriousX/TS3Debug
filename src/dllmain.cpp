@@ -5,6 +5,8 @@
 //   BaseLoop::s_Scenes                          -> LoopScenes instance
 //   Cheats::Daemon()                            -> per-frame hook (main thread)
 //   Cheats::s_cheats / Cheats::Info[16]         -> God, Stealth, Ammo, Time...
+//   ("Wireframe" and "Say Stress" are registered but compiled out of the retail
+//    game: their callbacks are stubs, so they are not exposed here.)
 //   FreeCamControlMapper vtable (GetAxis, ButtonDown) -> keyboard flight
 // Everything is found by signature scan at runtime, nothing is hardcoded.
 
@@ -72,9 +74,7 @@ struct Keys
     int ammo         = VK_F5;
     int unlockLevels = VK_F6;
     int stopTime     = VK_F7;
-    int wireframe    = VK_F8;
-    int timeCycle    = VK_F9;
-    int sayStress    = VK_F11;
+    int timeCycle    = VK_F8;
     // free camera flight
     int fwd = 'W', back = 'S', left = 'A', right = 'D';
     int up = VK_SPACE, down = 'C';
@@ -302,9 +302,7 @@ static void __fastcall Daemon_Hook()
         if (Pressed(g_keys.ammo))         ToggleCheat("Ammo");
         if (Pressed(g_keys.unlockLevels)) ToggleCheat("Unlock levels");
         if (Pressed(g_keys.stopTime))     ToggleCheat("Stop Time");
-        if (Pressed(g_keys.wireframe))    ToggleCheat("Wireframe");
         if (Pressed(g_keys.timeCycle))    CycleTime();
-        if (Pressed(g_keys.sayStress))    ToggleCheat("Say Stress");
     }
     g_DaemonOrig();
 }
@@ -379,9 +377,7 @@ static void LoadConfig()
     k.ammo         = IniKey("Ammo", k.ammo);
     k.unlockLevels = IniKey("UnlockLevels", k.unlockLevels);
     k.stopTime     = IniKey("StopTime", k.stopTime);
-    k.wireframe    = IniKey("Wireframe", k.wireframe);
     k.timeCycle    = IniKey("TimeCycle", k.timeCycle);
-    k.sayStress    = IniKey("SayStress", k.sayStress);
     k.fwd          = IniKey("CamForward", k.fwd);
     k.back         = IniKey("CamBack", k.back);
     k.left         = IniKey("CamLeft", k.left);

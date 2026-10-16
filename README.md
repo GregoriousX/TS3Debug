@@ -2,7 +2,7 @@
 
 An ASI plugin for **Toy Story 3: Complete Edition** (PC, Steam) that turns on debug
 features left in the game: a **free camera**, the hidden **cheat list**
-(god mode, infinite ammo, time control, wireframe…) and **keyboard flight** for the free camera.
+(god mode, infinite ammo, stealth, time control…) and **keyboard flight** for the free camera.
 
 ## Features
 
@@ -15,9 +15,7 @@ features left in the game: a **free camera**, the hidden **cheat list**
 | **F5** | Infinite ammo |
 | **F6** | Unlock all levels |
 | **F7** | Stop time |
-| **F8** | Wireframe rendering |
-| **F9** | Game speed: normal → 2x → 1/2x → 1/4x → 1/8x → normal |
-| **F11** | "Say Stress" (audio debug: voice line stress test) |
+| **F8** | Game speed: normal → 2x → 1/2x → 1/4x → 1/8x → normal |
 
 **Free camera controls**
 
@@ -70,6 +68,8 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
   the same folder as the exe.
 - **The log says `unsupported game version`.** A game update changed the code. The plugin
   disables itself instead of patching the wrong place. Please open an issue and attach the log.
+- **What about the "Wireframe" and "Say Stress" cheats?** The game's cheat table lists them,
+  but their code was removed from the retail game, so there is nothing to switch on.
 - **Nothing happens when I press a key.** Make sure you are in a level, not in a menu,
   and that the game window has focus.
 
