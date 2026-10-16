@@ -5,6 +5,6 @@ if not exist %VCVARS% set VCVARS="C:\Program Files\Microsoft Visual Studio\18\Co
 call %VCVARS% >nul || exit /b 1
 cd /d "%~dp0"
 if not exist bin mkdir bin
-cl /nologo /O2 /MT /W4 /EHsc /LD src\dllmain.cpp /Fo:bin\ /Fe:bin\TS3Debug.asi /link user32.lib kernel32.lib || exit /b 1
+cl /nologo /O2 /MT /W4 /EHsc /LD src\dllmain.cpp /Fo:bin\ /Fe:bin\TS3Debug.asi /link user32.lib kernel32.lib gdi32.lib || exit /b 1
 copy /y TS3Debug.ini bin\ >nul
 echo Built bin\TS3Debug.asi

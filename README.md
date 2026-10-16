@@ -1,21 +1,30 @@
 # TS3Debug
 
 An ASI plugin for **Toy Story 3: Complete Edition** (PC, Steam) that turns on debug
-features left in the game: a **free camera**, the hidden **cheat list**
-(god mode, infinite ammo, stealth, time control…) and **keyboard flight** for the free camera.
+features left in the game: a **free camera**, **god mode**, hidden cheats (stealth, infinite ammo),
+**pause / slow motion / frame-by-frame advance**, an **actor spawner** with 43 characters and
+creatures, and a **debug menu** to drive it all with the mouse.
 
 ## Features
 
 | Key | Action |
 |-----|--------|
+| **Home** | Show / hide the debug menu |
 | **F1** | Free camera on / off |
 | **F2** | Free camera on → freeze it in place and give control back to the player → off |
-| **F3** | God mode |
-| **F4** | Stealth |
-| **F5** | Infinite ammo |
-| **F6** | Unlock all levels |
-| **F7** | Stop time |
-| **F8** | Game speed: normal → 2x → 1/2x → 1/4x → 1/8x → normal |
+| **F3** | God mode (health stays full and hits can't kill you; you still flinch when hit) |
+| **F4** | Stealth (enemies don't notice your shots or impacts) |
+| **F5** | Infinite ammo (only where the game counts ammo: shooting sections and limited throwables) |
+| **F6** | Pause / resume time |
+| **F7** | Game speed: normal → 2x → 1/2x → 1/4x → 1/8x → normal |
+| **F8** | Frame advance: pauses time if needed, then each press steps one frame (F6 resumes) |
+| **Insert** | Spawn the selected actor in front of the player |
+| **Page Down / Page Up** | Select the next / previous actor |
+
+**Debug menu (Home):** a small always-on-top window with buttons for every feature, the
+time controls and a list of all spawnable actors (double-click to spawn). It never takes focus away
+from the game, so you can keep playing while it's open. Play in windowed or borderless mode to
+see it on top of the game.
 
 **Free camera controls**
 
@@ -26,9 +35,17 @@ features left in the game: a **free camera**, the hidden **cheat list**
 | Up / down | Space / C | RB / RT |
 | Faster / slower | Left Shift / Left Ctrl | — |
 
-Tip: **Stop time (F7) + free camera (F1)** works as a photo mode.
+Tip: **Pause (F6) + free camera (F1)** works as a photo mode, and **F8** lets you step through
+the action one frame at a time.
 
-The hotkeys only work while you are in a level, not in the menus. When you toggle a cheat,
+**Spawnable actors:** Alien, Barnacle, Bat, Bendito, Blockhead, Bullseye, Caterpillar, CoinShip,
+Cow, Dragon, Fairy, Gargoyle, Ghost, LittleGreenMan, Mule, Monkey, Muffin, MuffinBoss,
+DollyWitchBoss, Slimes, ZurgBot, ZurgBotCaptain, ZurgMinion, ZurgSpider, UFOs, Dr. Porkchop's UFO,
+Hamm's mothership, Orphan, TNT barrel, pets (chicken, goat, pigs) and more. Most of them belong in the
+Toy Box. In story levels, actors whose assets aren't loaded may not appear.
+
+Game actions only run while you are in a level. Anything you click in the menu outside a level
+waits until you are back in one. When you toggle a cheat,
 the game plays its own "cheat on/off" sound.
 
 ## Installation
@@ -57,6 +74,10 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
 | Option | Default | Description |
 |--------|---------|-------------|
 | `VoiceFeedback` | `1` | Play the game's cheat on/off sound |
+| `ShowMenuOnStart` | `0` | Open the debug menu when the game starts |
+| `GodBlocksInstantKill` | `0` | God mode also blocks instant kills, such as falling off the level (you may fall forever) |
+| `FrameStepFps` | `30` | How much time one frame advance step covers |
+| `SpawnDistance` | `5.0` | How far in front of the player actors spawn |
 | `KeyboardControl` | `1` | Fly the free camera with the keyboard |
 | `FastMultiplier` / `SlowMultiplier` | `3.0` / `0.25` | Speed modifiers (Shift / Ctrl) |
 | `LookSpeed` | `1.0` | Arrow-key look speed |
@@ -68,8 +89,11 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
   the same folder as the exe.
 - **The log says `unsupported game version`.** A game update changed the code. The plugin
   disables itself instead of patching the wrong place. Please open an issue and attach the log.
-- **What about the "Wireframe" and "Say Stress" cheats?** The game's cheat table lists them,
-  but their code was removed from the retail game, so there is nothing to switch on.
+- **What about "Unlock levels", "Wireframe" and "Say Stress"?** The game's internal cheat table lists
+  them (and its own "God"), but the code that would use them was removed from the retail game.
+  God mode in this plugin is implemented separately.
+- **I can't see the debug menu.** It can't draw over exclusive fullscreen. Switch the game to
+  windowed or borderless mode.
 - **Nothing happens when I press a key.** Make sure you are in a level, not in a menu,
   and that the game window has focus.
 
@@ -79,7 +103,14 @@ Every key and option can be changed in `TS3Debug.ini`. You can write a key as
   game update breaks a signature, the plugin switches itself off and writes the reason to the log
   instead of patching the wrong place.
 - The free camera is the engine's own. The plugin only switches it on and off.
-- Cheats come from the game's own cheat table. They are looked up by name and toggled the same way the game does it.
+- Pause, game speed and frame advance drive the game's master timer directly, using its built-in
+  speed settings and single-step mode.
+- God mode lets hits play out normally, so knock-backs and recovery work as usual. It caps
+  damage so a hit can never be lethal, then refills the player's health.
+- The actor spawner builds each actor from its parameter list and passes it to the game's own actor creator, the same way the game spawns actors in levels.
+- Stealth and infinite ammo are flags in the game's own cheat table, which the game still reads.
+  The game only applies them to a "cheat avatar" that the retail game never sets, so the plugin
+  sets it to the player.
 - The plugin hooks a function the game calls once per frame. Hotkeys are handled there, so all game
   code runs on the game's main thread.
 - To add keyboard flight, the plugin patches only the free camera's input handler. Normal gameplay controls
