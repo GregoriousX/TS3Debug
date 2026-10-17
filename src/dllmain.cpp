@@ -3,6 +3,7 @@
 // Game code used:
 //   LoopScenes::ActivateFreeCamera(int, bool)   -> free camera toggle
 //   BaseLoop::s_Scenes                          -> LoopScenes instance
+//   LoopScenes::CreateFreeCameras()             -> fix: no duplicate free camera on later level loads
 //   Cheats::Daemon()                            -> per-frame hook (main thread)
 //   Cheats::s_cheats / Cheats::Info[16]         -> Stealth, Ammo flags
 //   Cheats::s_avatar                            -> who Stealth/Ammo apply to (never set by the game)
@@ -49,7 +50,12 @@ static_assert(sizeof(CheatInfo) == 0x68, "CheatInfo size");
 enum TimeSpeed { SPEED_STOP = 0, SPEED_EIGHTH = 2, SPEED_QUARTER = 3, SPEED_HALF = 4, SPEED_DOUBLE = 5, SPEED_NORMAL = 9 };
 
 using ActivateFreeCamera_t = bool (__fastcall*)(void* loopScenes, int player, bool toggle);
-using Daemon_t             = void (__fastcall*)();
+using CreateFreeCameras_t  = void (__fastcall*)(void* loopScenes);
+using FocusCurrent_t       = uint8_t*(__fastcall*)(void* focusMgr, int player);
+using FocusFind_t          = void*(__fastcall*)(void* focusMgr, const char* name, int player);
+using FocusPop_t           = void (__fastcall*)(void* focusMgr, void* mapper, int player);
+using PropStackRemove_t    = bool (__fastcall*)(void* stack, int propSetId);
+using Daemon_t            = void (__fastcall*)();
 using GetAxis_t            = float(__fastcall*)(void* mapper, int axis);
 using ButtonDown_t         = bool (__fastcall*)(void* mapper, int button, bool raw);
 using VoiceQueue_t         = void (__fastcall*)(void* queue, const char* name, float delay, bool b, float f);
@@ -75,6 +81,12 @@ static char     g_logPath[MAX_PATH];
 
 static ActivateFreeCamera_t g_ActivateFreeCamera;
 static void*      g_loopScenes;
+static CreateFreeCameras_t g_CreateFreeCamerasOrig; // trampoline
+static uint8_t*          g_focusMgr;       // ControllerFocusManager
+static FocusCurrent_t    g_FocusCurrent;
+static FocusFind_t       g_FocusFind;
+static FocusPop_t        g_FocusPop;
+static PropStackRemove_t g_PropStackRemove; // CameraPropertySetStack::Remove
 static Daemon_t   g_DaemonOrig;          // trampoline
 static uint8_t*   g_daemon;
 static void**     g_cheatGuard;          // object with vfunc +0x28: "cheats blocked"
@@ -422,13 +434,22 @@ static void FrameStep()
     *reinterpret_cast<uint8_t*>(g_timer + 0x48) = 1;
 }
 
+static uint8_t* CurrentCamera();
+static bool FreeCameraOverridden();
+static void ForceFreeCameraOff();
+
 static void FreeCamera(bool fullToggle)
 {
     if (!g_ActivateFreeCamera || !g_loopScenes) return;
+    // Another camera (a cutscene) took over while the free camera was on. The
+    // game would push the free camera a second time; switch it off instead.
+    if (FreeCameraOverridden()) { ForceFreeCameraOff(); return; }
     // toggle=true : off -> on, on -> off
     // toggle=false: off -> on, on -> freeze camera & give control back, again -> off
+    uint8_t* before = CurrentCamera();
     bool r = g_ActivateFreeCamera(g_loopScenes, 0, fullToggle);
-    Log("ActivateFreeCamera(%d) -> %d", fullToggle, r);
+    Log("ActivateFreeCamera(%d) -> %d (camera was %s)", fullToggle, r,
+        before ? reinterpret_cast<const char*>(before + 0x20) : "?");
 }
 
 static const int kSpawnCount = (int)(sizeof(kSpawnDefs) / sizeof(kSpawnDefs[0]));
@@ -504,6 +525,38 @@ static bool FreeCameraActive()
 {
     uint8_t* cam = CurrentCamera();
     return cam && strcmp(reinterpret_cast<const char*>(cam + 0x20), "FreeCam") == 0;
+}
+
+// Player 0's controller focus is the free camera mapper (name at +0x134).
+static bool FreeCameraHasFocus()
+{
+    if (!g_FocusCurrent || !g_focusMgr) return false;
+    uint8_t* mapper = g_FocusCurrent(g_focusMgr, 0);
+    return mapper && strcmp(reinterpret_cast<const char*>(mapper + 0x134), "FreeCam") == 0;
+}
+
+// The free camera holds the controller, but the scene shows another camera.
+static bool FreeCameraOverridden()
+{
+    return g_FocusPop && g_PropStackRemove && FreeCameraHasFocus() && CurrentCamera() && !FreeCameraActive();
+}
+
+// ActivateFreeCamera's "off" path only runs while the free camera is the
+// current camera. When a cutscene camera has taken over, undo the activation
+// by hand: give the controller back and take the free camera's property set
+// off the scene's stack, so nothing is left behind when the cutscene ends.
+static void ForceFreeCameraOff()
+{
+    void** scenes = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(g_loopScenes) + 8);
+    if (!scenes || !scenes[0]) return;
+    for (int i = 0; i < 4 && FreeCameraHasFocus(); ++i)
+        g_FocusPop(g_focusMgr, g_FocusFind(g_focusMgr, "FreeCam", 0), 0);
+    void* stack = *reinterpret_cast<void**>(static_cast<uint8_t*>(scenes[0]) + 0x258);
+    int propSet = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(g_loopScenes) + 0x78);
+    if (stack && propSet != -1)
+        for (int i = 0; i < 4; ++i) g_PropStackRemove(stack, propSet);   // no-op once it is gone
+    g_carry = false;
+    Log("free camera: another camera took over, free camera switched off");
 }
 
 // Same steps as the game's ActorSetPosition script command.
@@ -666,6 +719,33 @@ static void __fastcall Daemon_Hook()
     UpdateCarry();
 
     g_DaemonOrig();
+}
+
+// CameraScene::FindGroup("FreeCam"): groups list at scene+0x60, name inline at +8, next at +0x68
+static bool SceneHasFreeCam(uint8_t* scene)
+{
+    for (uint8_t* g = scene ? *reinterpret_cast<uint8_t**>(scene + 0x60) : nullptr; g; g = *reinterpret_cast<uint8_t**>(g + 0x68))
+        if (strcmp(reinterpret_cast<const char*>(g + 8), "FreeCam") == 0) return true;
+    return false;
+}
+
+// LoopScenes::CreateFreeCameras. Level loads after the first one call it twice:
+// ActorLoop::Initialize (the scenes survive the previous level) and again from
+// Players::Create. Level teardown removes only one free camera, so the leftover
+// mapper is found first by ActivateFreeCamera and gets the controller focus
+// while the camera reads the new mapper: player and camera are both frozen.
+// Create the free cameras only once per scene set.
+static void __fastcall CreateFreeCameras_Hook(uint8_t* loopScenes)
+{
+    int count = *reinterpret_cast<int*>(loopScenes);
+    uint8_t** scenes = *reinterpret_cast<uint8_t***>(loopScenes + 8);
+    for (int i = 0; scenes && i < count; ++i)
+        if (SceneHasFreeCam(scenes[i]))
+        {
+            Log("CreateFreeCameras: free camera already exists, skipped");
+            return;
+        }
+    g_CreateFreeCamerasOrig(loopScenes);
 }
 
 static float KeyAxis(int neg, int pos)
@@ -1277,10 +1357,15 @@ static bool Init()
         "48 89 5C 24 20 55 56 57 48 83 EC 20 48 63 FA 41 0F B6 D8 48 8B F1 85 D2 0F 88"));
 
     // BaseLoop::Initialize: lea rcx,s_Scenes; call CreateFreeCameras; xor r8d,r8d; xor edx,edx; lea rcx,s_Scenes; call ActivateFreeCamera
+    uint8_t* createFreeCameras = nullptr;
     if (uint8_t* p = FindPattern("48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 45 33 C0 33 D2 48 8D 0D ?? ?? ?? ?? E8"))
     {
         g_loopScenes = Rip(p, 3, 7);
         if (Rip(p + 24, 1, 5) != reinterpret_cast<uint8_t*>(g_ActivateFreeCamera)) g_loopScenes = nullptr;
+        // prologue: push rbx/rbp/rsi/rdi/r14/r15; sub rsp,58h; movaps [rsp+40h],xmm6 (18 bytes, no rip-relative)
+        createFreeCameras = Rip(p + 7, 1, 5);
+        if (memcmp(createFreeCameras, "\x40\x53\x55\x56\x57\x41\x56\x41\x57\x48\x83\xEC\x58\x0F\x29\x74\x24\x40\x48\x8B\xF1", 21) != 0)
+            createFreeCameras = nullptr;
     }
 
     // Cheats::Daemon
@@ -1322,6 +1407,16 @@ static bool Init()
         {
             g_cameraDirector = reinterpret_cast<void**>(Rip(f + 0x7b, 3, 7));
             g_CurrentCamera = reinterpret_cast<CurrentCamera_t>(Rip(f + 0x86, 1, 5));
+        }
+        // lea rcx, ControllerFocusManager; call Current | call Find | call Pop | mov rcx,[scene+258h]; call CameraPropertySetStack::Remove
+        if (f[0x42] == 0x48 && f[0x43] == 0x8D && f[0x44] == 0x0D && f[0x49] == 0xE8 && f[0xd5] == 0xE8 && f[0x183] == 0xE8 &&
+            memcmp(f + 0x1ba, "\x48\x8B\x89\x58\x02\x00\x00\xE8", 8) == 0)
+        {
+            g_focusMgr       = Rip(f + 0x42, 3, 7);
+            g_FocusCurrent   = reinterpret_cast<FocusCurrent_t>(Rip(f + 0x49, 1, 5));
+            g_FocusFind      = reinterpret_cast<FocusFind_t>(Rip(f + 0xd5, 1, 5));
+            g_FocusPop       = reinterpret_cast<FocusPop_t>(Rip(f + 0x183, 1, 5));
+            g_PropStackRemove = reinterpret_cast<PropStackRemove_t>(Rip(f + 0x1c1, 1, 5));
         }
     }
 
@@ -1366,6 +1461,11 @@ static bool Init()
         return false;
     }
     g_DaemonOrig = reinterpret_cast<Daemon_t>(HookEntry(g_daemon, 16, reinterpret_cast<void*>(&Daemon_Hook)));
+    if (createFreeCameras)
+        g_CreateFreeCamerasOrig = reinterpret_cast<CreateFreeCameras_t>(
+            HookEntry(createFreeCameras, 18, reinterpret_cast<void*>(&CreateFreeCameras_Hook)));
+    Log("CreateFreeCameras=%p focus=%p/%p/%p/%p propRemove=%p", createFreeCameras,
+        g_focusMgr, g_FocusCurrent, g_FocusFind, g_FocusPop, g_PropStackRemove);
 
     if (g_freeCamVtbl)
     {

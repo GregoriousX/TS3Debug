@@ -116,7 +116,9 @@ Every key and option can also be changed in `TS3Debug.ini`. You can write a key 
 - All game addresses are found at startup by signature scan. Nothing is hardcoded. If a
   game update breaks a signature, the plugin switches itself off and writes the reason to the log
   instead of patching the wrong place.
-- The free camera is the engine's own. The plugin only switches it on and off.
+- The free camera is the engine's own. The plugin switches it on and off and works around two engine
+  bugs: from the second level load on, the game created a duplicate free camera that froze both the
+  player and the camera, and a cutscene taking over the camera left the free camera half active.
 - Pause, game speed and frame advance drive the game's master timer directly, using its built-in
   speed settings and single-step mode.
 - Position save/load and teleporting move the character the same way the game's own level scripts do.
