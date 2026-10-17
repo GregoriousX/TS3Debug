@@ -55,6 +55,8 @@ using FocusCurrent_t       = uint8_t*(__fastcall*)(void* focusMgr, int player);
 using FocusFind_t          = void*(__fastcall*)(void* focusMgr, const char* name, int player);
 using FocusPop_t           = void (__fastcall*)(void* focusMgr, void* mapper, int player);
 using PropStackRemove_t    = bool (__fastcall*)(void* stack, int propSetId);
+using Update_t             = void (__fastcall*)(uint8_t* self);
+using FloatPropGet_t       = float(__fastcall*)(uint8_t* prop, void* arg);
 using Daemon_t            = void (__fastcall*)();
 using GetAxis_t            = float(__fastcall*)(void* mapper, int axis);
 using ButtonDown_t         = bool (__fastcall*)(void* mapper, int button, bool raw);
@@ -82,6 +84,10 @@ static char     g_logPath[MAX_PATH];
 static ActivateFreeCamera_t g_ActivateFreeCamera;
 static void*      g_loopScenes;
 static CreateFreeCameras_t g_CreateFreeCamerasOrig; // trampoline
+static CreateFreeCameras_t g_CreateFreeCamerasFn;   // unhooked entry (trampoline or original)
+static CreateFreeCameras_t g_DeleteFreeCameras;     // LoopScenes::DeleteFreeCameras
+static uint8_t**           g_propSetMgr;            // CSingleton<CameraPropertySetManager>::s_instance
+static void**              g_eyePropSetVtbl;        // EyeCameraPropertySet (cutscene shots)
 static uint8_t*          g_focusMgr;       // ControllerFocusManager
 static FocusCurrent_t    g_FocusCurrent;
 static FocusFind_t       g_FocusFind;
@@ -119,6 +125,7 @@ static SavedPos  g_slots[3];
 static volatile bool g_carry;           // player follows the free camera
 static volatile bool g_capturing;       // a key is being rebound in the menu: hotkeys are suspended
 static volatile bool g_god;
+static volatile bool g_infiniteAmmo;
 static volatile LONG g_spawnIndex;
 static volatile DWORD g_lastDaemonTick;  // GetTickCount() of the last in-level frame
 static int  g_resumeSpeed = SPEED_NORMAL;
@@ -377,6 +384,15 @@ static void ToggleGod()
     Voice(g_god ? "cheat_on" : "cheat_off");
 }
 
+// Weapon hooks do the work (see WeaponUpdate_Hook). The game's own Ammo cheat
+// flag is left alone: with it on, some ball counters dropped to zero.
+static void ToggleAmmo()
+{
+    g_infiniteAmmo = !g_infiniteAmmo;
+    Log("infinite ammo -> %s", g_infiniteAmmo ? "ON" : "OFF");
+    Voice(g_infiniteAmmo ? "cheat_on" : "cheat_off");
+}
+
 static int CurrentSpeed()
 {
     if (g_timer && *reinterpret_cast<int32_t*>(g_timer + 0x3c) == 0) return SPEED_STOP;
@@ -437,6 +453,31 @@ static void FrameStep()
 static uint8_t* CurrentCamera();
 static bool FreeCameraOverridden();
 static void ForceFreeCameraOff();
+static int g_camCheck;                  // frames until we check that the free camera took over
+
+// CameraScene: +0x78 CameraGroup** stack, +0x80 count (top = last); group name at +8,
+// its selected camera at +0x50 (camera name at +0x20).
+static void LogCameraGroups(const char* why)
+{
+    void** scenes = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(g_loopScenes) + 8);
+    uint8_t* scene = scenes ? static_cast<uint8_t*>(scenes[0]) : nullptr;
+    if (!scene) return;
+    uint8_t** groups = *reinterpret_cast<uint8_t***>(scene + 0x78);
+    int count = *reinterpret_cast<int*>(scene + 0x80);
+    char text[512] = "";
+    for (int i = 0; groups && i < count && i < 16; ++i)
+    {
+        uint8_t* cam = groups[i] ? *reinterpret_cast<uint8_t**>(groups[i] + 0x50) : nullptr;
+        _snprintf_s(text + strlen(text), sizeof(text) - strlen(text), _TRUNCATE, "%s%s/%s", i ? " < " : "",
+                  groups[i] ? reinterpret_cast<const char*>(groups[i] + 8) : "?",
+                  cam ? reinterpret_cast<const char*>(cam + 0x20) : "-");
+    }
+    Log("%s: camera groups (bottom..top) %s", why, text);
+}
+
+static void PrepareFreeCamera();
+static bool FreeCameraActive();
+static bool FreeCameraHasFocus();
 
 static void FreeCamera(bool fullToggle)
 {
@@ -444,12 +485,22 @@ static void FreeCamera(bool fullToggle)
     // Another camera (a cutscene) took over while the free camera was on. The
     // game would push the free camera a second time; switch it off instead.
     if (FreeCameraOverridden()) { ForceFreeCameraOff(); return; }
+    // Pushing the free camera over a cutscene camera crashes the game when the
+    // cutscene ends (its FOV callback is left dangling).
+    uint8_t* cam = CurrentCamera();
+    if (cam && strcmp(reinterpret_cast<const char*>(cam + 0x20), "EyeCamera") == 0)
+    {
+        Log("free camera: not available during cutscenes");
+        return;
+    }
     // toggle=true : off -> on, on -> off
     // toggle=false: off -> on, on -> freeze camera & give control back, again -> off
+    if (!FreeCameraActive() && !FreeCameraHasFocus()) PrepareFreeCamera();
     uint8_t* before = CurrentCamera();
     bool r = g_ActivateFreeCamera(g_loopScenes, 0, fullToggle);
     Log("ActivateFreeCamera(%d) -> %d (camera was %s)", fullToggle, r,
         before ? reinterpret_cast<const char*>(before + 0x20) : "?");
+    if (r) g_camCheck = 5;
 }
 
 static const int kSpawnCount = (int)(sizeof(kSpawnDefs) / sizeof(kSpawnDefs[0]));
@@ -559,6 +610,78 @@ static void ForceFreeCameraOff()
     Log("free camera: another camera took over, free camera switched off");
 }
 
+// Cutscenes leave state behind on scene 0's CameraPropertySetStack (+0x258):
+// records (+0x28 list head, next at +0, priority at +0x10, set id at +0x14) whose
+// property set resolves to "EyeCamera", the animated camera the cutscene drove.
+// The game takes the camera from the first record that resolves for the scene,
+// so switching the free camera on (or off) lands on the last cutscene frame.
+// A property set maps scenes to cameras in a hash map: +0xbb0 buckets, +0xbc0
+// bucket count, nodes { next, u32 hash at +8, scene at +0x10, camera at +0x18 }.
+static uint8_t* SetCameraForUnsafe(uint8_t* set, uint8_t* scene)
+{
+    uint8_t** buckets = *reinterpret_cast<uint8_t***>(set + 0xbb0);
+    uint32_t n = *reinterpret_cast<uint32_t*>(set + 0xbc0);
+    if (!buckets || !n || !scene) return nullptr;
+    uint64_t key = reinterpret_cast<uint64_t>(scene);
+    uint32_t hash = static_cast<uint32_t>(key >> 32) ^ static_cast<uint32_t>(key);
+    for (uint8_t* node = buckets[hash % n]; node; node = *reinterpret_cast<uint8_t**>(node))
+        if (*reinterpret_cast<uint32_t*>(node + 8) == hash && *reinterpret_cast<uint8_t**>(node + 0x10) == scene)
+            return *reinterpret_cast<uint8_t**>(node + 0x18);
+    return nullptr;
+}
+
+static uint8_t* SetCameraFor(uint8_t* set, uint8_t* scene)
+{
+    __try { return SetCameraForUnsafe(set, scene); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static const char* CameraName(uint8_t* cam) { return cam ? reinterpret_cast<const char*>(cam + 0x20) : "-"; }
+
+// Before switching the free camera on: rebuild it if its property set is gone or
+// no longer leads to the FreeCam camera, and drop records that lead to EyeCamera.
+static void PrepareFreeCamera()
+{
+    if (!g_propSetMgr || !*g_propSetMgr || !g_PropStackRemove) return;
+    uint8_t* mgr = *g_propSetMgr;
+    void** sets = *reinterpret_cast<void***>(mgr + 8);
+    int setCount = *reinterpret_cast<int*>(mgr + 0x10);
+    auto setOf = [&](int id) -> uint8_t* { return sets && id >= 0 && id < setCount ? static_cast<uint8_t*>(sets[id]) : nullptr; };
+
+    void** scenes = *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(g_loopScenes) + 8);
+    uint8_t* scene = scenes ? static_cast<uint8_t*>(scenes[0]) : nullptr;
+    uint8_t* stack = scene ? *reinterpret_cast<uint8_t**>(scene + 0x258) : nullptr;
+    if (!stack) return;
+    uint8_t* key = *reinterpret_cast<uint8_t**>(stack + 0x50);
+    if (!key) key = scene;
+
+    int id = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(g_loopScenes) + 0x78);
+    uint8_t* own = setOf(id);
+    uint8_t* ownCam = own ? SetCameraFor(own, key) : nullptr;
+    if ((!ownCam || strcmp(CameraName(ownCam), "FreeCam") != 0) && g_DeleteFreeCameras && g_CreateFreeCamerasFn)
+    {
+        Log("free camera: its camera set %d leads to %s, rebuilding the free camera", id, own ? CameraName(ownCam) : "(deleted)");
+        g_DeleteFreeCameras(g_loopScenes);
+        g_CreateFreeCamerasFn(g_loopScenes);
+        id = *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(g_loopScenes) + 0x78);
+    }
+
+    char dump[512] = "";
+    int stale[32], n = 0;
+    for (uint8_t* rec = *reinterpret_cast<uint8_t**>(stack + 0x28); rec && n < 32; rec = *reinterpret_cast<uint8_t**>(rec))
+    {
+        int recId = *reinterpret_cast<int*>(rec + 0x14);
+        uint8_t* set = setOf(recId);
+        uint8_t* cam = set ? SetCameraFor(set, key) : nullptr;
+        _snprintf_s(dump + strlen(dump), sizeof(dump) - strlen(dump), _TRUNCATE, "%s[%d prio %d -> %s]", dump[0] ? " " : "", recId,
+                  *reinterpret_cast<int*>(rec + 0x10), set ? CameraName(cam) : "(no set)");
+        if (recId != id && cam && strcmp(CameraName(cam), "EyeCamera") == 0) stale[n++] = recId;
+    }
+    Log("free camera: camera stack (top first) %s", dump);
+    for (int i = 0; i < n; ++i) g_PropStackRemove(stack, stale[i]);
+    if (n) Log("free camera: removed %d records left behind by cutscenes", n);
+}
+
 // Same steps as the game's ActorSetPosition script command.
 static bool SetActorPosition(uint8_t* actor, const float* p)
 {
@@ -662,7 +785,7 @@ static void Execute(int cmd)
     case CMD_DETACH:  FreeCamera(false); break;
     case CMD_GOD:     ToggleGod(); break;
     case CMD_STEALTH: ToggleCheat("Stealth"); break;
-    case CMD_AMMO:    ToggleCheat("Ammo"); break;
+    case CMD_AMMO:    ToggleAmmo(); break;
     case CMD_PAUSE:   TogglePause(); break;
     case CMD_STEP:    FrameStep(); break;
     case CMD_SPAWN:   SpawnActor(g_spawnIndex); break;
@@ -682,12 +805,12 @@ static void __fastcall Daemon_Hook()
 {
     g_lastDaemonTick = GetTickCount();
     ApplyGod();
-    // AI perception and Gun::UseAmmo only honour Stealth/Ammo for the actor whose
+    // AI perception only honours Stealth for the actor whose
     // handle is in Cheats::s_avatar. The retail game never sets it.
     if (g_cheatAvatar)
     {
         uint8_t* avatar = PlayerAvatar();
-        bool needed = CheatEnabled("Stealth") || CheatEnabled("Ammo");
+        bool needed = CheatEnabled("Stealth");
         *g_cheatAvatar = (needed && avatar) ? *reinterpret_cast<uint64_t*>(avatar + 0x38) : 0;
     }
 
@@ -717,6 +840,8 @@ static void __fastcall Daemon_Hook()
     ReleaseSRWLockExclusive(&g_queueLock);
     for (int i = 0; i < n; ++i) Execute(cmds[i]);
     UpdateCarry();
+
+    if (g_camCheck && --g_camCheck == 0 && !FreeCameraActive()) LogCameraGroups("free camera did not take over");
 
     g_DaemonOrig();
 }
@@ -829,6 +954,145 @@ static uint64_t __fastcall Kill_Hook(void* health, void* source)
 {
     if (g_god && g_godBlocksKill && IsPlayerHealth(health)) return 0;
     return g_KillOrig[I](health, source);
+}
+
+// ---------------------------------------------------------------------------
+// Cutscene camera FOV
+// ---------------------------------------------------------------------------
+// A cutscene's AnimatedCameraNode binds a FOV callback (with itself as context) to
+// camera float properties. After the cutscene the node is freed but the binding
+// can stay behind; switching cameras then calls it and the game crashes. The
+// float property getter (TypeProperty<float> vtable slot 1: +0x20 cached value,
+// +0x28 context, +0x30 callback) drops a binding whose node is gone, so the
+// cached value is used instead.
+static FloatPropGet_t g_FloatPropGetOrig;
+static void*          g_animFovGetter;  // AnimatedCameraNode FOV callback
+static void**         g_animNodeVtbl;
+
+static bool LiveAnimNode(uint8_t* node)
+{
+    __try
+    {
+        if (*reinterpret_cast<void***>(node) != g_animNodeVtbl) return false;
+        uint64_t handle = *reinterpret_cast<uint64_t*>(node + 0x2b8);   // what the callback reads first
+        return handle == 0 || (handle < 0x00007FFFFFFFFFFFull && (handle & 7) == 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static float __fastcall FloatPropGet_Hook(uint8_t* prop, void* arg)
+{
+    uint8_t* ctx = *reinterpret_cast<uint8_t**>(prop + 0x28);
+    if (*reinterpret_cast<void**>(prop + 0x30) == g_animFovGetter && ctx && !LiveAnimNode(ctx))
+    {
+        *reinterpret_cast<void**>(prop + 0x28) = nullptr;
+        *reinterpret_cast<void**>(prop + 0x30) = nullptr;
+        Log("camera: dropped a FOV binding to a finished cutscene");
+    }
+    return g_FloatPropGetOrig(prop, arg);
+}
+
+static void HookCutsceneFov()
+{
+    // AnimatedCameraNode FOV callback: ...; call ...; mov rbp,rax; xor ebx,ebx; ...; mov rdi,[rdi+2B8h]
+    g_animFovGetter = FindPattern("48 89 5C 24 10 55 56 57 48 83 EC 30 0F 29 74 24 20 48 8B F9 E8 ?? ?? ?? ?? "
+                                  "48 8B E8 33 DB 48 89 5C 24 60 48 8B BF B8 02 00 00");
+    g_animNodeVtbl = FindVtable(".?AVAnimatedCameraNode@Meridian@@");
+    void** propVtbl = FindVtable(".?AV?$TypeProperty@M@@");
+    // slot 1: push rbx; sub rsp,20h; mov rbx,rcx; test rdx,rdx
+    bool ok = g_animFovGetter && g_animNodeVtbl && propVtbl &&
+              memcmp(propVtbl[1], "\x40\x53\x48\x83\xEC\x20\x48\x8B\xD9\x48\x85\xD2", 12) == 0;
+    if (ok) g_FloatPropGetOrig = reinterpret_cast<FloatPropGet_t>(PatchVtable(propVtbl, 1, reinterpret_cast<void*>(&FloatPropGet_Hook)));
+    Log("cutscene FOV guard: %s (getter %p node vtbl %p)", ok ? "on" : "NOT installed", g_animFovGetter, g_animNodeVtbl);
+}
+
+// ---------------------------------------------------------------------------
+// Infinite ammo
+// ---------------------------------------------------------------------------
+// The game's own Ammo cheat only covers Gun and Lobbed, and only for the actor in
+// Cheats::s_avatar; the Blaster (Buzz's laser) ignores it. Instead, every
+// weapon class's Update is hooked and the player's weapon is topped up.
+enum AmmoKind { AMMO_COUNT, AMMO_RESERVE, AMMO_ENERGY };
+struct AmmoClass
+{
+    const char* rtti;
+    AmmoKind    kind;
+    uint32_t    field;      // int ammo count / reserve, or float energy (0..1)
+    Update_t    orig;
+    void**      vtbl;
+};
+static AmmoClass g_ammoClasses[] =
+{
+    { ".?AVGun@@",           AMMO_COUNT,   0x3d8 },
+    { ".?AVTS3ShooterGun@@", AMMO_COUNT,   0x3d8 },
+    { ".?AVLobbed@@",        AMMO_COUNT,   0x3cc },   // thrown balls
+    { ".?AVFirearm@@",       AMMO_RESERVE, 0x410 },   // clip +0x3d8 reloads from here
+    { ".?AVBlaster@@",       AMMO_ENERGY,  0x408 },
+};
+static const int kAmmoClassCount = (int)(sizeof(g_ammoClasses) / sizeof(g_ammoClasses[0]));
+
+static bool PlayerOwns(uint8_t* weapon)
+{
+    uint8_t* avatar = PlayerAvatar();
+    return avatar && *reinterpret_cast<uint64_t*>(weapon + 0x18) == *reinterpret_cast<uint64_t*>(avatar + 0x38);
+}
+
+static void FillAmmo(uint8_t* weapon, const AmmoClass& c)
+{
+    if (c.kind == AMMO_ENERGY)
+    {
+        *reinterpret_cast<float*>(weapon + c.field) = 1.0f;
+        return;
+    }
+    // MaxAmmo() is vtable slot 15
+    int max = reinterpret_cast<int(__fastcall*)(void*)>((*reinterpret_cast<void***>(weapon))[15])(weapon);
+    int* ammo = reinterpret_cast<int*>(weapon + c.field);
+    if (max > 0 && *ammo >= 0 && *ammo < max) *ammo = max;   // -1 = unlimited, leave it
+}
+
+// A Weapon points to its properties at +0x10; the name is inline at +0x14.
+static const char* WeaponName(uint8_t* weapon)
+{
+    uint8_t* props = weapon ? *reinterpret_cast<uint8_t**>(weapon + 0x10) : nullptr;
+    return props ? reinterpret_cast<const char*>(props + 0x14) : nullptr;
+}
+
+template <int I>
+static void __fastcall WeaponUpdate_Hook(uint8_t* weapon)
+{
+    g_ammoClasses[I].orig(weapon);
+    if (!g_infiniteAmmo || !PlayerOwns(weapon)) return;
+    const AmmoClass& c = g_ammoClasses[I];
+    static uint8_t* seen[32];           // log each player weapon once
+    for (int i = 0; i < 32; ++i)
+    {
+        if (seen[i] == weapon) break;
+        if (seen[i]) continue;
+        seen[i] = weapon;
+        const char* name = WeaponName(weapon);
+        Log("ammo: %s %s field %#x = %d", c.rtti, name ? name : "?", c.field,
+            c.kind == AMMO_ENERGY ? (int)(*reinterpret_cast<float*>(weapon + c.field) * 100) : *reinterpret_cast<int*>(weapon + c.field));
+        break;
+    }
+    FillAmmo(weapon, c);
+}
+
+template <int I> static void HookWeaponClass()
+{
+    AmmoClass& c = g_ammoClasses[I];
+    void** vtbl = FindVtable(c.rtti);
+    if (!vtbl) { Log("ammo: %s not found", c.rtti); return; }
+    c.vtbl = vtbl;
+    c.orig = reinterpret_cast<Update_t>(PatchVtable(vtbl, 36, reinterpret_cast<void*>(&WeaponUpdate_Hook<I>)));
+}
+
+static void HookWeapons()
+{
+    HookWeaponClass<0>(); HookWeaponClass<1>(); HookWeaponClass<2>(); HookWeaponClass<3>(); HookWeaponClass<4>();
+    static_assert(kAmmoClassCount == 5, "one HookWeaponClass per entry");
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +1271,7 @@ static void RefreshMenu()
     bool inLevel = GetTickCount() - g_lastDaemonTick < 1000;
     SendMessageA(g_chkGod, BM_SETCHECK, g_god ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_chkStealth, BM_SETCHECK, CheatEnabled("Stealth") ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageA(g_chkAmmo, BM_SETCHECK, CheatEnabled("Ammo") ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(g_chkAmmo, BM_SETCHECK, g_infiniteAmmo ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(g_chkCarry, BM_SETCHECK, g_carry ? BST_CHECKED : BST_UNCHECKED, 0);
 
     const char* speed = "1x";
@@ -1445,6 +1709,15 @@ static bool Init()
     }
     Log("UpdateState=%p posVfunc=%#x/%#x", g_UpdateState, g_posVfuncA, g_posVfuncB);
 
+
+    // LoopScenes::DeleteFreeCameras
+    g_DeleteFreeCameras = reinterpret_cast<CreateFreeCameras_t>(FindPattern("48 89 5C 24 10 56 48 83 EC 20 33 F6 48 8B D9 39 31 0F 8E"));
+    // CameraPropertySet::Create: mov rbx,[CameraPropertySetManager]; mov rbp,[rbx+10h]; mov rcx,[rbx+18h]; cmp rbp,rcx
+    if (uint8_t* p = FindPattern("48 8B 1D ?? ?? ?? ?? 48 8B 6B 10 48 8B 4B 18 48 3B E9"))
+        g_propSetMgr = reinterpret_cast<uint8_t**>(Rip(p, 3, 7));
+    g_eyePropSetVtbl = FindVtable(".?AVEyeCameraPropertySet@@");
+    Log("DeleteFreeCameras=%p propSetMgr=%p eyeSetVtbl=%p", g_DeleteFreeCameras, g_propSetMgr, g_eyePropSetVtbl);
+
     // HealthIF subobject vtables (offset 0x18) of both health tracker classes
     void** healthVtbl[2] = { FindVtable(".?AVTS3HealthTracker@@", 0x18), FindVtable(".?AVHealthTracker@@", 0x18) };
 
@@ -1464,6 +1737,7 @@ static bool Init()
     if (createFreeCameras)
         g_CreateFreeCamerasOrig = reinterpret_cast<CreateFreeCameras_t>(
             HookEntry(createFreeCameras, 18, reinterpret_cast<void*>(&CreateFreeCameras_Hook)));
+    g_CreateFreeCamerasFn = g_CreateFreeCamerasOrig;
     Log("CreateFreeCameras=%p focus=%p/%p/%p/%p propRemove=%p", createFreeCameras,
         g_focusMgr, g_FocusCurrent, g_FocusFind, g_FocusPop, g_PropStackRemove);
 
@@ -1483,6 +1757,9 @@ static bool Init()
         g_DoDamageOrig[i]        = reinterpret_cast<DoDamage_t>(PatchVtable(healthVtbl[i], 16, damageHooks[i]));
         g_KillOrig[i]            = reinterpret_cast<Kill_t>(PatchVtable(healthVtbl[i], 18, killHooks[i]));
     }
+    HookWeapons();
+    HookCutsceneFov();
+
     Log("hooks installed");
     return true;
 }

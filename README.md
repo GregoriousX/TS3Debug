@@ -14,7 +14,7 @@ an **actor spawner** with 43 characters and creatures, and a **debug menu** to d
 | **F2** | Free camera on → freeze it in place and give control back to the player → off |
 | **F3** | God mode (health stays full and hits can't kill you; you still flinch when hit) |
 | **F4** | Stealth (enemies don't notice your shots or impacts) |
-| **F5** | Infinite ammo (only where the game counts ammo: shooting sections and limited throwables) |
+| **F5** | Infinite ammo for the player's weapons (guns, throwables and Buzz's laser) |
 | **F6** | Pause / resume time |
 | **F7** | Game speed: normal → 2x → 1/2x → 1/4x → 1/8x → normal |
 | **F8** | Frame advance: pauses time if needed, then each press steps one frame (F6 resumes) |
@@ -119,16 +119,18 @@ Every key and option can also be changed in `TS3Debug.ini`. You can write a key 
   instead of patching the wrong place.
 - The free camera is the engine's own. The plugin switches it on and off and works around two engine
   bugs: from the second level load on, the game created a duplicate free camera that froze both the
-  player and the camera, and a cutscene taking over the camera left the free camera half active.
+  player and the camera, and cutscenes leave camera state behind that made the free camera show the
+  last cutscene frame or crash the game. The free camera can't be switched on during a cutscene.
 - Pause, game speed and frame advance drive the game's master timer directly, using its built-in
   speed settings and single-step mode.
 - Position save/load and teleporting move the character the same way the game's own level scripts do.
 - God mode lets hits play out normally, so knock-backs and recovery work as usual. It caps
   damage so a hit can never be lethal, then refills the player's health.
 - The actor spawner builds each actor from its parameter list and passes it to the game's own actor creator, the same way the game spawns actors in levels.
-- Stealth and infinite ammo are flags in the game's own cheat table, which the game still reads.
-  The game only applies them to a "cheat avatar" that the retail game never sets, so the plugin
-  sets it to the player.
+- Stealth is a flag in the game's own cheat table, which the game still reads. The game only
+  applies it to a "cheat avatar" that the retail game never sets, so the plugin sets it to the player.
+- Infinite ammo tops up the player's weapons every frame. The game's own ammo cheat skips Buzz's
+  laser and some throwables, so the plugin doesn't use it.
 - The plugin hooks a function the game calls once per frame. Hotkeys are handled there, so all game
   code runs on the game's main thread.
 - To add keyboard flight, the plugin patches only the free camera's input handler. Normal gameplay controls
