@@ -59,16 +59,17 @@ the game plays its own "cheat on/off" sound.
 
 ## Installation
 
-1. Download `TS3Debug.zip` from the [Releases](../../releases) page.
-2. Extract it into the game folder, next to `Toy Story 3 Complete Edition.exe`:
+1. Install [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)
+   (x64) if you don't have an ASI loader yet: put its `dinput8.dll` in the game folder, next to
+   `Toy Story 3 Complete Edition.exe`. The loader is not included in `TS3Debug.zip`.
+2. Download `TS3Debug.zip` from the [Releases](../../releases) page and extract it into the same folder:
    ```
    Toy Story 3 Complete Edition\
    ├── Toy Story 3 Complete Edition.exe
-   ├── dinput8.dll        ← Ultimate ASI Loader
+   ├── dinput8.dll        ← Ultimate ASI Loader (step 1)
    ├── TS3Debug.asi
    └── TS3Debug.ini
    ```
-   If you already have an ASI loader installed, copy only `TS3Debug.asi` and `TS3Debug.ini`.
 3. Start the game. On a successful start `TS3Debug.log` is created next to the exe.
 
 To uninstall, delete `dinput8.dll`, `TS3Debug.asi`, `TS3Debug.ini` and `TS3Debug.log`.
